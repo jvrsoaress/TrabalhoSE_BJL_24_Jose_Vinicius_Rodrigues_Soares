@@ -1,236 +1,208 @@
-/* Descrição:
- * Este projeto demonstra o uso de multicore no RP2040, conforme a tarefa.
- *
- * Núcleo 0 (Core 0):
- * - Responsável pela aquisição contínua de dados.
- * - Sensor 1: Leitor RFID MFRC522 (via SPI).
- * - Sensor 2: Potenciômetro do Joystick (via ADC no GPIO 26).
- * - Envia dados para o Core 1 via FIFO.
- *
- * Núcleo 1 (Core 1):
- * - Responsável pela Interface de Usuário (UI).
- * - Atuador 1: Display OLED SSD1306 (via I2C).
- * - Atuador 2: LEDs (Azul e Verde).
- * - Recebe dados do Core 0 via FIFO e atualiza a UI.
+/*
+ * ATIVIDADE: Utilização de dois núcleos no RP2040 (BitDogLab)
+ * Objetivo: Paralelismo entre leitura de sensores e interface com display, LEDs e buzzer
+ * 
+ * Core 0: Lê BMP280 (temperatura) e AHT20 (umidade) a cada 500ms
+ * Core 1: Atualiza display OLED, controla LEDs RGB e buzzer com base nos dados
+ * Comunicação: FIFO do RP2040 (push no Core 0 → pop no Core 1)
+ * 
+ * Adicionado:
+ *   - Buzzer com PWM (GPIO 21)
+ *   - Alerta: T ≥ 32°C ou U ≥ 55% → LED vermelho + buzzer
  */
 
 #include <stdio.h>
-#include <string.h>
 #include "pico/stdlib.h"
-#include "pico/multicore.h"  // <--- Biblioteca Multicore
-#include "hardware/adc.h"   // <--- Biblioteca ADC
-#include "lib/ssd1306.h"
-#include "lib/font.h"
-#include "mfrc522.h"
+#include "pico/multicore.h"
+#include "pico/bootrom.h"
+#include "hardware/i2c.h"
+#include "hardware/pwm.h"
+#include "hardware/clocks.h"
+#include "aht20.h"
+#include "bmp280.h"
+#include "ssd1306.h"
+#include "font.h"
+#include <math.h>
 
-// --- Configurações (do seu código original) ---
-#define I2C_PORT i2c1
-#define I2C_SDA 14
-#define I2C_SCL 15
-#define endereco 0x3C
+/* ===========================================================================
+ *                            DEFINIÇÕES DE HARDWARE
+ * =========================================================================== */
 
-#define LED_AZUL 12
-#define LED_VERDE 13
+#define I2C_PORT_SENSORS i2c0
+#define I2C_SDA_SENSORS  0
+#define I2C_SCL_SENSORS  1
 
-// --- Configurações dos Sensores ---
-#define ADC_PIN 26 // GPIO 26 para o ADC (Canal 0)
-#define ADC_CHANNEL 0
+#define I2C_PORT_DISPLAY i2c1
+#define I2C_SDA_DISPLAY  14
+#define I2C_SCL_DISPLAY  15
+#define OLED_ADDR        0x3C
 
-// --- Protocolo de Comunicação FIFO ---
-// Usamos um enum para dizer ao Core 1 que tipo de dado estamos enviando
-typedef enum {
-    TYPE_ADC_DATA,      // Indica que o próximo uint32_t é um valor de ADC
-    TYPE_RFID_UID,      // Indica que o próximo uint32_t é uma UID de 4 bytes
-    TYPE_RFID_FAIL      // Indica que a leitura do RFID falhou
-} data_type_t;
+#define LED_R 13
+#define LED_G 11
+#define LED_B 12
 
-// ====================================================================
-//               CÓDIGO DO NÚCLEO 1 (CORE 1) - INTERFACE
-// ====================================================================
-//
+#define BUZZER_PIN 21
+#define BUZZER_FREQUENCY 3500
 
-/*
- * Esta função será a entrada principal do Core 1.
- * Ela inicializa os periféricos da UI (Display, LEDs)
- * e entra em um loop para sempre, aguardando dados do Core 0.
- */
+#define BOTAO_B 6
+
+/* ===========================================================================
+ *                        VARIÁVEIS GLOBAIS COMPARTILHADAS
+ * =========================================================================== */
+
+ssd1306_t ssd;
+struct bmp280_calib_param params;
+char str_temp[8] = "T:--.-C";
+char str_umi[8]  = "U:--.-%";
+bool cor = true;
+
+#define ALERTA_TEMPERATURA_MAX 32.0f
+#define ALERTA_UMIDADE_MAX     55.0f
+
+/* ===========================================================================
+ *                     FUNÇÕES DO BUZZER (PWM)
+ * =========================================================================== */
+
+void pwm_init_buzzer(uint pin) {
+    gpio_set_function(pin, GPIO_FUNC_PWM);
+    uint slice_num = pwm_gpio_to_slice_num(pin);
+    pwm_config config = pwm_get_default_config();
+    pwm_config_set_clkdiv(&config, clock_get_hz(clk_sys) / (BUZZER_FREQUENCY * 4096));
+    pwm_init(slice_num, &config, true);
+    pwm_set_gpio_level(pin, 0);
+}
+
+static inline void buzzer_on() {
+    pwm_set_gpio_level(BUZZER_PIN, 2048);
+}
+
+static inline void buzzer_off() {
+    pwm_set_gpio_level(BUZZER_PIN, 0);
+}
+
+/* ===========================================================================
+ *                  FUNÇÕES DO CORE 1 (Interface)
+ * =========================================================================== */
+
+void gpio_irq_handler(uint gpio, uint32_t events) {
+    reset_usb_boot(0, 0);
+}
+
+void core1_entry(void);
+
+/* ===========================================================================
+ *                         CORE 1: INTERFACE DE USUÁRIO
+ * =========================================================================== */
 void core1_entry() {
-    // --- Inicializa Periféricos do Core 1 ---
-    
-    // Inicializa LEDs
-    gpio_init(LED_AZUL);
-    gpio_set_dir(LED_AZUL, GPIO_OUT);
-    gpio_put(LED_AZUL, 0);
+    i2c_init(I2C_PORT_DISPLAY, 400 * 1000);
+    gpio_set_function(I2C_SDA_DISPLAY, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_DISPLAY, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_DISPLAY);
+    gpio_pull_up(I2C_SCL_DISPLAY);
 
-    gpio_init(LED_VERDE);
-    gpio_set_dir(LED_VERDE, GPIO_OUT);
-    gpio_put(LED_VERDE, 0);
-
-    // Inicializa display
-    i2c_init(I2C_PORT, 400 * 1000);
-    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA);
-    gpio_pull_up(I2C_SCL);
-    ssd1306_t ssd;
-    ssd1306_init(&ssd, WIDTH, HEIGHT, false, endereco, I2C_PORT);
+    ssd1306_init(&ssd, 128, 64, false, OLED_ADDR, I2C_PORT_DISPLAY);
     ssd1306_config(&ssd);
     ssd1306_fill(&ssd, false);
     ssd1306_send_data(&ssd);
 
-    // --- Variáveis de Estado da UI ---
-    char adc_str[24];         // String para valor do ADC
-    char status_msg1[24] = "Aproxime o";
-    char status_msg2[24] = "  CARTAO";
-    uint16_t last_adc_val = 0;
-    bool cor = true;
+    gpio_init(LED_R); gpio_set_dir(LED_R, GPIO_OUT);
+    gpio_init(LED_G); gpio_set_dir(LED_G, GPIO_OUT);
+    gpio_init(LED_B); gpio_set_dir(LED_B, GPIO_OUT);
+    gpio_put(LED_G, 1);
 
-    // --- Loop Principal do Core 1 ---
+    pwm_init_buzzer(BUZZER_PIN);
+    buzzer_off();
+
+    printf("Core 1: Display, LEDs e Buzzer inicializados.\n");
+
     while (true) {
-        // 1. Aguarda e processa dados do Core 0
-        // multicore_fifo_pop_blocking() espera até que um dado chegue
-        data_type_t data_type = (data_type_t)multicore_fifo_pop_blocking();
-        uint32_t payload = multicore_fifo_pop_blocking();
+        uint32_t temp_raw = multicore_fifo_pop_blocking();
+        uint32_t umi_raw  = multicore_fifo_pop_blocking();
 
-        switch (data_type) {
-            case TYPE_ADC_DATA:
-                last_adc_val = (uint16_t)payload;
-                break;
+        float temperatura = temp_raw / 100.0f;
+        float umidade     = umi_raw  / 100.0f;
 
-            case TYPE_RFID_UID:
-                // Desliga LEDs (preparação)
-                gpio_put(LED_AZUL, 0);
-                gpio_put(LED_VERDE, 0);
+        bool alerta = (temperatura >= ALERTA_TEMPERATURA_MAX) || (umidade >= ALERTA_UMIDADE_MAX);
 
-                // Descompacta a UID de 4 bytes do payload
-                uint8_t uid[4];
-                uid[0] = (payload >> 0) & 0xFF; // Byte 0
-                uid[1] = (payload >> 8) & 0xFF; // Byte 1
-                uid[2] = (payload >> 16) & 0xFF; // Byte 2
-                uid[3] = (payload >> 24) & 0xFF; // Byte 3
-
-                // Atualiza mensagens do display
-                strcpy(status_msg1, "UID:");
-                sprintf(status_msg2, "%02X %02X %02X %02X", uid[0], uid[1], uid[2], uid[3]);
-
-                // Verifica UID para acionar LEDs (lógica do seu main.c)
-                if (uid[0] == 0x00 && uid[1] == 0xFC && uid[2] == 0x95 && uid[3] == 0x7C) {
-                    gpio_put(LED_AZUL, 1);
-                } else if (uid[0] == 0xC0 && uid[1] == 0x33 && uid[2] == 0xC3 && uid[3] == 0x80) {
-                    gpio_put(LED_VERDE, 1);
-                }
-                break;
-
-            case TYPE_RFID_FAIL:
-                strcpy(status_msg1, "Falha na");
-                strcpy(status_msg2, " Leitura");
-                gpio_put(LED_AZUL, 0);
-                gpio_put(LED_VERDE, 0);
-                break;
+        if (alerta) {
+            gpio_put(LED_R, 1); gpio_put(LED_G, 0); gpio_put(LED_B, 0);
+            buzzer_on();
+        } else {
+            gpio_put(LED_R, 0); gpio_put(LED_G, 1); gpio_put(LED_B, 0);
+            buzzer_off();
         }
 
-        // 2. Redesenha a tela com os dados mais recentes
-        // Esta seção é executada sempre que um *novo* dado (ADC ou RFID) é recebido
-        
-        // Formata string do ADC
-        sprintf(adc_str, "ADC: %-4d", last_adc_val);
+        sprintf(str_temp, "%.1fC", temperatura);
+        sprintf(str_umi,  "%.1f%%", umidade);
 
-        ssd1306_fill(&ssd, !cor);                     // Limpa o display
-        ssd1306_rect(&ssd, 3, 3, 122, 60, cor, !cor); // Desenha um retângulo
-        ssd1306_line(&ssd, 3, 25, 123, 25, cor);      // Desenha uma linha
-        ssd1306_line(&ssd, 3, 37, 123, 37, cor);      // Desenha uma linha
+        ssd1306_fill(&ssd, !cor);
+        ssd1306_rect(&ssd, 3, 3, 122, 60, cor, !cor);
+        ssd1306_line(&ssd, 3, 25, 123, 25, cor);
+        ssd1306_line(&ssd, 3, 37, 123, 37, cor);
         ssd1306_draw_string(&ssd, "CEPEDI   TIC37", 8, 6);
         ssd1306_draw_string(&ssd, "EMBARCATECH", 20, 16);
-        
-        // --- Área de Dados Dinâmicos ---
-        ssd1306_draw_string(&ssd, adc_str, 10, 28);      // Mostra valor do ADC
-        ssd1306_draw_string(&ssd, status_msg1, 8, 41);   // Mostra status RFID (Linha 1)
-        ssd1306_draw_string(&ssd, status_msg2, 8, 52);   // Mostra status RFID (Linha 2)
+        ssd1306_draw_string(&ssd, "BMP280  AHT10", 10, 28);
+        ssd1306_line(&ssd, 63, 25, 63, 60, cor);
+        ssd1306_draw_string(&ssd, str_temp, 14, 41);
+        ssd1306_draw_string(&ssd, str_umi,  73, 41);
+        ssd1306_send_data(&ssd);
 
-        ssd1306_send_data(&ssd); // Envia o buffer para o display
+        cor = !cor;
+
+        printf("Core 1: T=%.1f°C | U=%.1f%% | %s\n",
+               temperatura, umidade, alerta ? "ALERTA! (LED + BUZZER)" : "Normal");
+
+        sleep_ms(100);
     }
 }
 
-// ====================================================================
-//               CÓDIGO DO NÚCLEO 0 (CORE 0) - AQUISIÇÃO
-// ====================================================================
-//
-
+/* ===========================================================================
+ *                         CORE 0: AQUISIÇÃO DE SENSORES
+ * =========================================================================== */
 int main() {
     stdio_init_all();
-    sleep_ms(2000); // Aguarda o monitor serial (opcional)
-    printf("Iniciando sistema Dual-Core RFID/ADC...\n");
+    sleep_ms(2000);
+    printf("=== SISTEMA MULTICORE COM BUZZER - BITDOGLAB ===\n");
 
-    // --- Inicializa Periféricos do Core 0 ---
+    gpio_init(BOTAO_B);
+    gpio_set_dir(BOTAO_B, GPIO_IN);
+    gpio_pull_up(BOTAO_B);
+    gpio_set_irq_enabled_with_callback(BOTAO_B, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
 
-    // Inicializa ADC (Sensor 2)
-    adc_init();
-    adc_gpio_init(ADC_PIN);
-    adc_select_input(ADC_CHANNEL);
+    i2c_init(I2C_PORT_SENSORS, 400 * 1000);
+    gpio_set_function(I2C_SDA_SENSORS, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_SENSORS, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_SENSORS);
+    gpio_pull_up(I2C_SCL_SENSORS);
 
-    // Inicializa MFRC522 (Sensor 1)
-    MFRC522Ptr_t mfrc = MFRC522_Init();
-    PCD_Init(mfrc, spi0);
-    PCD_AntennaOn(mfrc);
-    printf("Core 0: MFRC522 e ADC inicializados.\n");
+    bmp280_init(I2C_PORT_SENSORS);
+    bmp280_get_calib_params(I2C_PORT_SENSORS, &params);
+    aht20_reset(I2C_PORT_SENSORS);
+    aht20_init(I2C_PORT_SENSORS);
 
-    // --- Lança o Core 1 ---
-    printf("Core 0: Lançando Core 1 para cuidar da UI...\n");
+    printf("Core 0: Sensores BMP280 e AHT20 inicializados.\n");
+
     multicore_launch_core1(core1_entry);
+    printf("Core 0: Core 1 iniciado (interface + buzzer).\n");
 
-    // --- Loop Principal do Core 0 ---
+    AHT20_Data dados_aht;
+    int32_t raw_temp, raw_press;
+
     while (true) {
-        
-        // Tarefa 1: Ler ADC (Leitura contínua)
-        uint16_t adc_value = adc_read();
-        
-        // Envia dados do ADC para o Core 1
-        multicore_fifo_push_blocking(TYPE_ADC_DATA);
-        multicore_fifo_push_blocking(adc_value);
+        bmp280_read_raw(I2C_PORT_SENSORS, &raw_temp, &raw_press);
+        int32_t temp_x100 = bmp280_convert_temp(raw_temp, &params);
 
-        // Tarefa 2: Verificar RFID (Leitura não-bloqueante)
-        if (PICC_IsNewCardPresent(mfrc)) {
-            printf("Core 0: Cartão detectado!\n");
+        bool ok = aht20_read(I2C_PORT_SENSORS, &dados_aht);
+        int32_t umi_x100 = ok ? (int32_t)(dados_aht.humidity * 100) : -9999;
 
-            if (PICC_ReadCardSerial(mfrc)) {
-                // Sucesso na leitura
-                printf("Core 0: UID lida com sucesso.\n");
-                
-                // Compacta os 4 bytes da UID em um único uint32_t
-                // mfrc->uid.uidByte[0] -> byte menos significativo
-                // mfrc->uid.uidByte[3] -> byte mais significativo
-                uint32_t uid_compactada = 0;
-                uid_compactada |= (uint32_t)(mfrc->uid.uidByte[3]) << 24;
-                uid_compactada |= (uint32_t)(mfrc->uid.uidByte[2]) << 16;
-                uid_compactada |= (uint32_t)(mfrc->uid.uidByte[1]) << 8;
-                uid_compactada |= (uint32_t)(mfrc->uid.uidByte[0]);
+        multicore_fifo_push_blocking(temp_x100);
+        multicore_fifo_push_blocking(umi_x100);
 
-                // Envia dados do RFID para o Core 1
-                multicore_fifo_push_blocking(TYPE_RFID_UID);
-                multicore_fifo_push_blocking(uid_compactada);
+        printf("Core 0: Enviado → T=%.1f°C | U=%.1f%%\n",
+               temp_x100 / 100.0f, umi_x100 / 100.0f);
 
-            } else {
-                // Falha na leitura
-                printf("Core 0: Falha ao ler UID do cartão.\n");
-                multicore_fifo_push_blocking(TYPE_RFID_FAIL);
-                multicore_fifo_push_blocking(0); // Payload nulo
-            }
-
-            // Pausa para evitar múltiplas leituras do mesmo cartão
-            // O Core 1 continuará executando e atualizando o display
-            // com o último valor de ADC recebido antes desta pausa.
-            sleep_ms(2000); 
-
-            // Limpa os LEDs e reseta a UI para "Aproxime"
-            // (Enviando um novo dado de ADC, o Core 1 limpa a tela)
-            adc_value = adc_read();
-            multicore_fifo_push_blocking(TYPE_ADC_DATA);
-            multicore_fifo_push_blocking(adc_value);
-
-        }
-        
-        // Pequena pausa para não sobrecarregar o FIFO
-        // e dar tempo para o loop do Core 1 executar
-        sleep_ms(100); 
+        sleep_ms(500);
     }
+
+    return 0;
 }
